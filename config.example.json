@@ -1,0 +1,46 @@
+{
+  "exchange": {
+    "name": "bybit",
+    "testnet": false,
+    "demo": true,
+    "api_key": "YOUR_API_KEY",
+    "api_secret": "YOUR_API_SECRET"
+  },
+  "trading": {
+    "symbol": "BTCUSDT",
+    "interval": "240",
+    "category": "linear",
+    "leverage": 3,
+    "margin_mode": "ISOLATED",
+    "position_size_pct": 0.02,
+    "max_positions": 1
+  },
+  "strategy": {
+    "name": "V2: FVG + Trend (EMA200)",
+    "tp_pct": 0.05,
+    "min_fvg_pct": 0.003,
+    "max_sl_pct": 0.04,
+    "impulse_body_ratio": 0.5,
+    "ema_trend_period": 200,
+    "fill_lookback_candles": 12,
+    "use_trend_filter": true,
+    "use_volume_filter": false,
+    "use_rsi_filter": false,
+    "vol_threshold": 1.3
+  },
+  "risk": {
+    "max_daily_loss_pct": 0.05,
+    "max_drawdown_pct": 0.15,
+    "kill_switch_loss_pct": 0.20
+  },
+  "notifications": {
+    "enabled": false,
+    "telegram_token": "",
+    "telegram_chat_id": ""
+  },
+  "logging": {
+    "level": "INFO",
+    "file": "logs/bot.log",
+    "trade_log": "logs/trades.csv"
+  }
+}

@@ -23,15 +23,22 @@ class BybitConnector:
     Supports both testnet and mainnet.
     """
     
-    def __init__(self, api_key: str, api_secret: str, testnet: bool = True):
+    def __init__(self, api_key: str, api_secret: str, testnet: bool = True, demo: bool = False):
         self.testnet = testnet
+        self.demo = demo
         self.session = HTTP(
             testnet=testnet,
+            demo=demo,
             api_key=api_key,
             api_secret=api_secret,
         )
         
-        env = "TESTNET" if testnet else "⚠️  MAINNET"
+        if demo:
+            env = "DEMO TRADING"
+        elif testnet:
+            env = "TESTNET"
+        else:
+            env = "⚠️  MAINNET"
         logger.info(f"Connected to Bybit {env}")
         
         # Verify connection
@@ -59,9 +66,9 @@ class BybitConnector:
                     for coin in accounts[0].get("coin", []):
                         if coin["coin"] == "USDT":
                             return {
-                                "total": float(coin["walletBalance"]),
-                                "available": float(coin["availableToWithdraw"]),
-                                "unrealized_pnl": float(coin.get("unrealisedPnl", 0)),
+                                "total": float(coin["walletBalance"] or 0),
+                                "available": float(coin["availableToWithdraw"] or 0),
+                                "unrealized_pnl": float(coin.get("unrealisedPnl", 0) or 0),
                             }
             logger.warning(f"Could not get balance: {result.get('retMsg', 'Unknown error')}")
             return {"total": 0, "available": 0, "unrealized_pnl": 0}
