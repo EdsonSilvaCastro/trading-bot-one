@@ -1,0 +1,17 @@
+# Secrets — NEVER commit these
+config.json
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Logs (local data — stays on VPS)
+logs/*.log
+logs/*.csv
+
+# OS
+.DS_Store

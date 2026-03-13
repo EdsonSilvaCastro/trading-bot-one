@@ -26,6 +26,14 @@ from pathlib import Path
 from strategy import FVGStrategyEngine, FVGSignal
 from exchange import BybitConnector
 from telegram_notifier import TelegramNotifier
+from supabase_logger import SupabaseTradeLogger
+
+# Load .env file if present (python-dotenv); fail silently if not installed
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 
 # ============================================================================
@@ -58,6 +66,28 @@ def setup_logging(config: dict):
 
 
 # ============================================================================
+# KILLZONE DETECTION
+# ============================================================================
+
+def get_killzone(dt: datetime) -> str:
+    """
+    Determine ICT killzone based on UTC hour.
+    - LONDON:      02:00 - 05:00 UTC
+    - NEW_YORK:    07:00 - 10:00 UTC
+    - ASIA:        20:00 - 00:00 UTC
+    - OFF_SESSION: everything else
+    """
+    h = dt.hour
+    if 2 <= h < 5:
+        return "LONDON"
+    if 7 <= h < 10:
+        return "NEW_YORK"
+    if h >= 20 or h < 1:
+        return "ASIA"
+    return "OFF_SESSION"
+
+
+# ============================================================================
 # TRADE LOGGER (CSV)
 # ============================================================================
 
@@ -73,10 +103,15 @@ class TradeLogger:
                     "timestamp", "direction", "entry_price", "exit_price",
                     "stop_loss", "take_profit", "result", "pnl_pct", "pnl_usd",
                     "position_size", "duration_min", "fvg_size_pct", "sl_pct",
+                    "mae", "mfe", "killzone", "day_of_week", "hour_utc",
+                    "ema200_at_entry", "price_vs_ema", "bot_version",
                 ])
-    
-    def log_trade(self, trade_result, position_size_usd: float = 0):
+
+    def log_trade(self, trade_result, position_size_usd: float = 0,
+                  mae: float = 0.0, mfe: float = 0.0,
+                  killzone: str = "", day_of_week: str = "", hour_utc: int = 0):
         sig = trade_result.signal
+        bot_version = os.environ.get("BOT_VERSION", "v2.1")
         with open(self.filepath, "a", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([
@@ -93,6 +128,14 @@ class TradeLogger:
                 round(trade_result.duration_minutes, 1),
                 round(sig.fvg_size_pct * 100, 4),
                 round(sig.sl_pct * 100, 4),
+                round(mae, 4),
+                round(mfe, 4),
+                killzone,
+                day_of_week,
+                hour_utc,
+                "",  # ema200_at_entry
+                "",  # price_vs_ema
+                bot_version,
             ])
 
 
@@ -140,6 +183,27 @@ class RiskManager:
 
 
 # ============================================================================
+# HELPERS
+# ============================================================================
+
+def _apply_env_overrides(config: dict):
+    """Override config.json values with environment variables (env > config.json)."""
+    exchange = config.setdefault("exchange", {})
+    if os.environ.get("BYBIT_API_KEY"):
+        exchange["api_key"] = os.environ["BYBIT_API_KEY"]
+    if os.environ.get("BYBIT_API_SECRET"):
+        exchange["api_secret"] = os.environ["BYBIT_API_SECRET"]
+    if os.environ.get("BYBIT_DEMO"):
+        exchange["demo"] = os.environ["BYBIT_DEMO"].lower() in ("true", "1", "yes")
+
+    notifications = config.setdefault("notifications", {})
+    if os.environ.get("TELEGRAM_BOT_TOKEN"):
+        notifications["telegram_token"] = os.environ["TELEGRAM_BOT_TOKEN"]
+    if os.environ.get("TELEGRAM_CHAT_ID"):
+        notifications["telegram_chat_id"] = os.environ["TELEGRAM_CHAT_ID"]
+
+
+# ============================================================================
 # MAIN BOT
 # ============================================================================
 
@@ -147,7 +211,10 @@ class FVGBot:
     def __init__(self, config_path: str = "config.json"):
         with open(config_path) as f:
             self.config = json.load(f)
-        
+
+        # Environment variables take priority over config.json
+        _apply_env_overrides(self.config)
+
         self.logger = setup_logging(self.config)
         
         # Determine mode
@@ -210,14 +277,35 @@ class FVGBot:
         
         # Risk manager
         self.risk_manager = RiskManager(self.config, self.initial_balance)
-        
+
+        # Optional Supabase logger (enabled only if SUPABASE_URL is set)
+        if os.environ.get("SUPABASE_URL"):
+            self.supabase_logger: Optional[SupabaseTradeLogger] = SupabaseTradeLogger()
+            if not self.supabase_logger.enabled:
+                self.supabase_logger = None
+        else:
+            self.supabase_logger = None
+        supabase_status = "Enabled" if self.supabase_logger else "Disabled (SUPABASE_URL not set)"
+        self.logger.info(f"  Supabase logging: {supabase_status}")
+
         # State
         self.running = True
         self.current_order_id = None
         self.candle_count = 0
         self.last_candle_time = None
         self.last_daily_summary = None
-        
+        self.had_position = False          # Track if we had a position last check
+        self.last_position_entry = None    # Entry price of last known position
+        self.last_position_side = None     # Side of last known position
+        self.last_position_size = None     # Size of last known position
+        self.balance_before_trade = self.initial_balance  # Balance before last trade
+        self.trades_completed = 0          # Total trades tracked
+
+        # MAE/MFE tracking (reset when a new position opens)
+        self.current_mae = 0.0             # Maximum Adverse Excursion (%)
+        self.current_mfe = 0.0             # Maximum Favorable Excursion (%)
+        self.position_open_time: Optional[datetime] = None  # When position was detected
+
         # Graceful shutdown
         signal.signal(signal.SIGINT, self._shutdown)
         signal.signal(signal.SIGTERM, self._shutdown)
@@ -276,25 +364,130 @@ class FVGBot:
                 position = self.exchange.get_position(self.symbol)
                 if position:
                     self._monitor_position(position)
-                
+                    if not self.had_position:
+                        # Position just opened
+                        self.had_position = True
+                        self.last_position_entry = position["entry_price"]
+                        self.last_position_side = position["side"]
+                        self.last_position_size = position["size"]
+                        self.balance_before_trade = balance["total"]
+                        self.current_order_id = None  # Order was filled
+                        self.position_open_time = datetime.now()
+                        self.current_mae = 0.0
+                        self.current_mfe = 0.0
+                        self.logger.info(f"  📍 Position detected: {position['side']} {position['size']} @ {position['entry_price']:.2f}")
+                        self.telegram.trade_opened(
+                            direction="LONG" if position["side"] == "Buy" else "SHORT",
+                            entry_price=position["entry_price"],
+                            qty=position["size"],
+                            sl=position.get("stop_loss", 0),
+                            tp=position.get("take_profit", 0),
+                        )
+                elif self.had_position:
+                    # Position just closed (by SL or TP on Bybit's side)
+                    self.had_position = False
+                    new_balance = balance["total"]
+                    pnl_usd = new_balance - self.balance_before_trade
+                    pnl_pct = pnl_usd / self.balance_before_trade if self.balance_before_trade > 0 else 0
+
+                    result = "TP" if pnl_usd >= 0 else "SL"
+                    direction = "LONG" if self.last_position_side == "Buy" else "SHORT"
+
+                    # Compute duration and temporal context from when position was opened
+                    open_time = self.position_open_time or datetime.now()
+                    duration_min = int((datetime.now() - open_time).total_seconds() / 60)
+                    killzone = get_killzone(open_time)
+                    day_of_week = open_time.strftime("%a").upper()[:3]
+                    hour_utc = open_time.hour
+
+                    self.trades_completed += 1
+                    self.logger.info(
+                        f"  {'💰' if pnl_usd >= 0 else '📉'} Position closed by Bybit: {result} "
+                        f"| PnL: ${pnl_usd:+.2f} ({pnl_pct*100:+.2f}%) "
+                        f"| MAE: {self.current_mae:.2f}% | MFE: {self.current_mfe:.2f}%"
+                    )
+
+                    self.telegram.trade_closed(
+                        direction=direction,
+                        entry=self.last_position_entry or 0,
+                        exit_price=0,  # We don't know exact exit
+                        pnl_pct=pnl_pct,
+                        pnl_usd=pnl_usd,
+                        result=result,
+                        duration_min=duration_min,
+                    )
+
+                    # Log to CSV (primary)
+                    self._log_closed_trade(
+                        direction=direction,
+                        result=result,
+                        pnl_pct=pnl_pct,
+                        pnl_usd=pnl_usd,
+                        duration_min=duration_min,
+                        mae=self.current_mae,
+                        mfe=self.current_mfe,
+                        killzone=killzone,
+                        day_of_week=day_of_week,
+                        hour_utc=hour_utc,
+                    )
+
+                    # Log to Supabase (optional, non-blocking)
+                    if self.supabase_logger:
+                        bot_version = os.environ.get("BOT_VERSION", "v2.1")
+                        supabase_data = {
+                            "timestamp": open_time.isoformat(),
+                            "direction": direction,
+                            "symbol": self.symbol,
+                            "timeframe": f"{self.interval}m",
+                            "entry_price": self.last_position_entry or 0,
+                            "stop_loss": 0,
+                            "take_profit": 0,
+                            "position_size_usdt": round(
+                                float(self.last_position_size or 0) * float(self.last_position_entry or 0), 2
+                            ),
+                            "leverage": self.leverage,
+                            "result": result,
+                            "pnl_usdt": round(pnl_usd, 2),
+                            "pnl_pct": round(pnl_pct * 100, 4),
+                            "mae": round(self.current_mae, 4),
+                            "mfe": round(self.current_mfe, 4),
+                            "duration_min": duration_min,
+                            "killzone": killzone,
+                            "day_of_week": day_of_week,
+                            "hour_utc": hour_utc,
+                            "is_paper": self.is_demo or self.is_testnet,
+                            "bot_version": bot_version,
+                        }
+                        self.supabase_logger.log_trade(supabase_data)
+
+                    # Clear state for next trade
+                    self.last_position_entry = None
+                    self.last_position_side = None
+                    self.last_position_size = None
+                    self.position_open_time = None
+
                 # ===== FULL CANDLE ANALYSIS =====
                 if now - last_full_check >= candle_interval_seconds or last_full_check == 0:
                     self.logger.info(f"\n📊 Candle analysis at {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-                    
+
                     df = self.exchange.get_klines(self.symbol, self.interval, limit=250)
-                    
+
                     if df.empty or len(df) < 210:
                         self.logger.warning(f"Not enough candle data: {len(df)} candles")
                         time.sleep(60)
                         continue
-                    
+
                     self.candle_count = len(df)
                     latest = df.iloc[-1]
                     self.last_candle_time = latest["timestamp"]
-                    
+
+                    # Update MAE/MFE with actual candle high/low during active position
+                    if self.had_position:
+                        self._update_mae_mfe(float(latest["low"]), float(latest["high"]))
+
                     self.logger.info(f"   Latest candle: {latest['timestamp']} | Close: {latest['close']:.2f}")
                     self.logger.info(f"   Balance: {balance['total']:.2f} USDT | PnL: {balance['unrealized_pnl']:.2f}")
-                    
+
                     # Cancel expired signals
                     self.strategy.cancel_expired_signals(self.candle_count)
                     
@@ -331,13 +524,17 @@ class FVGBot:
                     ticker = self.exchange.get_ticker(self.symbol)
                     if ticker:
                         current_price = ticker["last_price"]
-                        
+
+                        # Update MAE/MFE using last price as proxy for high/low
+                        if self.had_position:
+                            self._update_mae_mfe(current_price, current_price)
+
                         active_pos = self.strategy.get_active_position()
                         if not active_pos:
                             filled = self.strategy.check_pending_fills(current_price, datetime.now())
                             if filled:
                                 self.logger.info(f"   Price {current_price:.2f} reached entry zone")
-                        
+
                         if self.current_order_id and not position:
                             self._check_order_status()
                 
@@ -406,6 +603,69 @@ class FVGBot:
             f"| PnL: {pnl:+.2f} USDT ({pnl_pct:+.1f}%) "
             f"| Liq: {position['liq_price']:.2f}"
         )
+
+    def _update_mae_mfe(self, current_low: float, current_high: float):
+        """Update in-memory MAE/MFE tracking for the active position."""
+        if not self.had_position or not self.last_position_entry:
+            return
+
+        entry = self.last_position_entry
+        direction = "LONG" if self.last_position_side == "Buy" else "SHORT"
+
+        if direction == "LONG":
+            adverse = (current_low - entry) / entry * 100
+            favorable = (current_high - entry) / entry * 100
+        else:  # SHORT
+            adverse = (entry - current_high) / entry * 100
+            favorable = (entry - current_low) / entry * 100
+
+        self.current_mae = min(self.current_mae, adverse)
+        self.current_mfe = max(self.current_mfe, favorable)
+
+    def _log_closed_trade(
+        self, direction: str, result: str, pnl_pct: float, pnl_usd: float,
+        duration_min: int = 0, mae: float = 0.0, mfe: float = 0.0,
+        killzone: str = "", day_of_week: str = "", hour_utc: int = 0,
+    ):
+        """Log a closed trade to CSV (primary persistence)."""
+        filepath = self.config.get("logging", {}).get("trade_log", "logs/trades.csv")
+        Path(filepath).parent.mkdir(exist_ok=True)
+        bot_version = os.environ.get("BOT_VERSION", "v2.1")
+
+        if not os.path.exists(filepath):
+            with open(filepath, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "timestamp", "direction", "entry_price", "exit_price",
+                    "stop_loss", "take_profit", "result", "pnl_pct", "pnl_usd",
+                    "position_size", "duration_min", "fvg_size_pct", "sl_pct",
+                    "mae", "mfe", "killzone", "day_of_week", "hour_utc",
+                    "ema200_at_entry", "price_vs_ema", "bot_version",
+                ])
+
+        with open(filepath, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                datetime.now().isoformat(),
+                direction,
+                round(self.last_position_entry or 0, 2),
+                "",  # Exit price unknown (Bybit closed it)
+                "", "",  # SL/TP already set on exchange
+                result,
+                round(pnl_pct * 100, 4),
+                round(pnl_usd, 2),
+                self.last_position_size or 0,
+                duration_min,
+                "", "",  # fvg_size_pct, sl_pct not available for exchange-closed trades
+                round(mae, 4),
+                round(mfe, 4),
+                killzone,
+                day_of_week,
+                hour_utc,
+                "",  # ema200_at_entry
+                "",  # price_vs_ema
+                bot_version,
+            ])
     
     def _check_daily_summary(self, balance: dict, stats: dict, position):
         now = datetime.now()
@@ -414,15 +674,36 @@ class FVGBot:
         if self.last_daily_summary == today:
             return
         
-        # Send daily summary at the first candle check of each day
         if now.hour >= 0:
             self.last_daily_summary = today
+            
+            # Count trades from CSV
+            trades_total = 0
+            wins_total = 0
+            losses_total = 0
+            total_pnl = 0
+            trade_log = self.config.get("logging", {}).get("trade_log", "logs/trades.csv")
+            if os.path.exists(trade_log):
+                try:
+                    with open(trade_log, "r") as f:
+                        reader = csv.DictReader(f)
+                        for row in reader:
+                            trades_total += 1
+                            pnl = float(row.get("pnl_pct", 0))
+                            total_pnl += pnl
+                            if pnl >= 0:
+                                wins_total += 1
+                            else:
+                                losses_total += 1
+                except Exception:
+                    pass
+            
             self.telegram.daily_summary(
                 balance=balance["total"],
-                total_pnl_pct=stats.get("total_pnl_pct", 0),
-                trades_today=0,
-                wins=stats.get("wins", 0),
-                losses=stats.get("losses", 0),
+                total_pnl_pct=total_pnl,
+                trades_today=trades_total,
+                wins=wins_total,
+                losses=losses_total,
                 active_position=position,
             )
     
