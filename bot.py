@@ -341,7 +341,7 @@ class FVGBot:
         if not self.supabase_logger:
             return
         try:
-            result = self.supabase_logger.client.table('bot_commands').select('*') \
+            result = self.supabase_logger._client.table('bot_commands').select('*') \
                 .or_('bot_name.eq.fvg,bot_name.eq.all') \
                 .eq('status', 'PENDING') \
                 .order('created_at', desc=False) \
@@ -360,7 +360,7 @@ class FVGBot:
                     self.logger.info('🔻 FLATTEN executed by dashboard')
                 elif cmd['command'] == 'KILL':
                     self._emergency_close()
-                    self.supabase_logger.client.table('bot_commands').update({
+                    self.supabase_logger._client.table('bot_commands').update({
                         'status': 'EXECUTED',
                         'executed_at': datetime.now(timezone.utc).isoformat(),
                         'result': 'KILL executed — process exiting'
@@ -368,7 +368,7 @@ class FVGBot:
                     self.logger.critical('💀 KILL command received — exiting')
                     sys.exit(0)
 
-                self.supabase_logger.client.table('bot_commands').update({
+                self.supabase_logger._client.table('bot_commands').update({
                     'status': 'EXECUTED',
                     'executed_at': datetime.now(timezone.utc).isoformat(),
                     'result': f"{cmd['command']} executed successfully"
@@ -382,7 +382,7 @@ class FVGBot:
             return
         try:
             proc = psutil.Process(os.getpid())
-            self.supabase_logger.client.table('bot_heartbeats').insert({
+            self.supabase_logger._client.table('bot_heartbeats').insert({
                 'bot_name': 'fvg',
                 'status': 'PAUSED' if self.paused else 'OK',
                 'cpu_pct': round(proc.cpu_percent(), 1),
