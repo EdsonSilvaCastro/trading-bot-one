@@ -20,7 +20,8 @@ import os
 import csv
 import signal
 import sys
-from datetime import datetime, timedelta
+import psutil
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from strategy import FVGStrategyEngine, FVGSignal
@@ -305,6 +306,7 @@ class FVGBot:
         self.current_mae = 0.0             # Maximum Adverse Excursion (%)
         self.current_mfe = 0.0             # Maximum Favorable Excursion (%)
         self.position_open_time: Optional[datetime] = None  # When position was detected
+        self.paused = False                # Controlled by dashboard commands
 
         # Graceful shutdown
         signal.signal(signal.SIGINT, self._shutdown)
@@ -334,6 +336,63 @@ class FVGBot:
         self.logger.info(f"  Position size: {qty} BTC (${position_value:.2f} notional, {self.leverage}x leverage)")
         return qty
     
+    def check_dashboard_commands(self):
+        """Check for pending commands from the dashboard."""
+        if not self.supabase_logger:
+            return
+        try:
+            result = self.supabase_logger.client.table('bot_commands').select('*') \
+                .or_('bot_name.eq.fvg,bot_name.eq.all') \
+                .eq('status', 'PENDING') \
+                .order('created_at', desc=False) \
+                .execute()
+
+            for cmd in result.data:
+                if cmd['command'] == 'PAUSE':
+                    self.paused = True
+                    self.logger.info('⏸ PAUSED by dashboard command')
+                elif cmd['command'] == 'RESUME':
+                    self.paused = False
+                    self.logger.info('▶ RESUMED by dashboard command')
+                elif cmd['command'] == 'FLATTEN':
+                    self._emergency_close()
+                    self.paused = True
+                    self.logger.info('🔻 FLATTEN executed by dashboard')
+                elif cmd['command'] == 'KILL':
+                    self._emergency_close()
+                    self.supabase_logger.client.table('bot_commands').update({
+                        'status': 'EXECUTED',
+                        'executed_at': datetime.now(timezone.utc).isoformat(),
+                        'result': 'KILL executed — process exiting'
+                    }).eq('id', cmd['id']).execute()
+                    self.logger.critical('💀 KILL command received — exiting')
+                    sys.exit(0)
+
+                self.supabase_logger.client.table('bot_commands').update({
+                    'status': 'EXECUTED',
+                    'executed_at': datetime.now(timezone.utc).isoformat(),
+                    'result': f"{cmd['command']} executed successfully"
+                }).eq('id', cmd['id']).execute()
+        except Exception as e:
+            self.logger.warning(f'Command check failed: {e}')
+
+    def send_heartbeat(self, cycle_duration_ms: int = 0):
+        """Send heartbeat to dashboard."""
+        if not self.supabase_logger:
+            return
+        try:
+            proc = psutil.Process(os.getpid())
+            self.supabase_logger.client.table('bot_heartbeats').insert({
+                'bot_name': 'fvg',
+                'status': 'PAUSED' if self.paused else 'OK',
+                'cpu_pct': round(proc.cpu_percent(), 1),
+                'mem_mb': round(proc.memory_info().rss / 1024 / 1024, 1),
+                'cycle_duration_ms': cycle_duration_ms,
+                'active_positions': 1 if self.had_position else 0,
+            }).execute()
+        except Exception as e:
+            self.logger.warning(f'Heartbeat failed: {e}')
+
     def run(self):
         self.logger.info(f"\n🚀 Bot starting...")
         self.logger.info(f"   Symbol: {self.symbol} | Interval: {self.interval}m | Leverage: {self.leverage}x")
@@ -348,8 +407,17 @@ class FVGBot:
         
         while self.running:
             try:
+                cycle_start = time.time()
+
+                # ===== DASHBOARD COMMANDS =====
+                self.check_dashboard_commands()
+                if self.paused:
+                    self.logger.info('⏸ Bot is PAUSED — skipping cycle')
+                    time.sleep(60)
+                    continue
+
                 now = time.time()
-                
+
                 # ===== RISK CHECK =====
                 balance = self.exchange.get_balance()
                 safe, reason = self.risk_manager.check(balance["total"])
@@ -538,8 +606,12 @@ class FVGBot:
                         if self.current_order_id and not position:
                             self._check_order_status()
                 
+                # ===== HEARTBEAT =====
+                cycle_ms = int((time.time() - cycle_start) * 1000)
+                self.send_heartbeat(cycle_ms)
+
                 time.sleep(check_interval_seconds)
-            
+
             except KeyboardInterrupt:
                 break
             except Exception as e:
