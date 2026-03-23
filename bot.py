@@ -28,6 +28,10 @@ from strategy import FVGStrategyEngine, FVGSignal
 from exchange import BybitConnector
 from telegram_notifier import TelegramNotifier
 from supabase_logger import SupabaseTradeLogger
+try:
+    from supabase import create_client as supabase_create_client
+except ImportError:
+    supabase_create_client = None
 
 # Load .env file if present (python-dotenv); fail silently if not installed
 try:
@@ -289,6 +293,17 @@ class FVGBot:
         supabase_status = "Enabled" if self.supabase_logger else "Disabled (SUPABASE_URL not set)"
         self.logger.info(f"  Supabase logging: {supabase_status}")
 
+        # Dashboard client using service role key (bypasses RLS for heartbeats/commands)
+        self._dashboard_client = None
+        svc_url = os.environ.get("SUPABASE_URL")
+        svc_key = os.environ.get("SUPABASE_SERVICE_KEY")
+        if svc_url and svc_key and supabase_create_client:
+            try:
+                self._dashboard_client = supabase_create_client(svc_url, svc_key)
+                self.logger.info("  Dashboard client: Enabled (service role)")
+            except Exception as e:
+                self.logger.warning(f"  Dashboard client failed to init: {e}")
+
         # State
         self.running = True
         self.current_order_id = None
@@ -338,10 +353,10 @@ class FVGBot:
     
     def check_dashboard_commands(self):
         """Check for pending commands from the dashboard."""
-        if not self.supabase_logger:
+        if not self._dashboard_client:
             return
         try:
-            result = self.supabase_logger._client.table('bot_commands').select('*') \
+            result = self._dashboard_client.table('bot_commands').select('*') \
                 .or_('bot_name.eq.fvg,bot_name.eq.all') \
                 .eq('status', 'PENDING') \
                 .order('created_at', desc=False) \
@@ -360,7 +375,7 @@ class FVGBot:
                     self.logger.info('🔻 FLATTEN executed by dashboard')
                 elif cmd['command'] == 'KILL':
                     self._emergency_close()
-                    self.supabase_logger._client.table('bot_commands').update({
+                    self._dashboard_client.table('bot_commands').update({
                         'status': 'EXECUTED',
                         'executed_at': datetime.now(timezone.utc).isoformat(),
                         'result': 'KILL executed — process exiting'
@@ -368,7 +383,7 @@ class FVGBot:
                     self.logger.critical('💀 KILL command received — exiting')
                     sys.exit(0)
 
-                self.supabase_logger._client.table('bot_commands').update({
+                self._dashboard_client.table('bot_commands').update({
                     'status': 'EXECUTED',
                     'executed_at': datetime.now(timezone.utc).isoformat(),
                     'result': f"{cmd['command']} executed successfully"
@@ -378,11 +393,11 @@ class FVGBot:
 
     def send_heartbeat(self, cycle_duration_ms: int = 0):
         """Send heartbeat to dashboard."""
-        if not self.supabase_logger:
+        if not self._dashboard_client:
             return
         try:
             proc = psutil.Process(os.getpid())
-            self.supabase_logger._client.table('bot_heartbeats').insert({
+            self._dashboard_client.table('bot_heartbeats').insert({
                 'bot_name': 'fvg',
                 'status': 'PAUSED' if self.paused else 'OK',
                 'cpu_pct': round(proc.cpu_percent(), 1),
