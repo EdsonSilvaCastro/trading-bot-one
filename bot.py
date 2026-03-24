@@ -466,6 +466,26 @@ class FVGBot:
                             sl=position.get("stop_loss", 0),
                             tp=position.get("take_profit", 0),
                         )
+                        # Log OPEN trade to Supabase so dashboard positions tab shows it
+                        if self.supabase_logger:
+                            try:
+                                self.supabase_logger.log_trade({
+                                    "timestamp": self.position_open_time.isoformat(),
+                                    "direction": "LONG" if position["side"] == "Buy" else "SHORT",
+                                    "symbol": self.symbol,
+                                    "timeframe": f"{self.interval}m",
+                                    "entry_price": position["entry_price"],
+                                    "stop_loss": position.get("stop_loss", 0),
+                                    "take_profit": position.get("take_profit", 0),
+                                    "position_size_usdt": round(float(position["size"]) * float(position["entry_price"]), 2),
+                                    "leverage": self.leverage,
+                                    "result": "OPEN",
+                                    "pnl_usdt": 0,
+                                    "pnl_pct": 0,
+                                    "is_paper": self.is_demo or self.is_testnet,
+                                })
+                            except Exception as e:
+                                self.logger.warning(f"Failed to log open trade: {e}")
                 elif self.had_position:
                     # Position just closed (by SL or TP on Bybit's side)
                     self.had_position = False
